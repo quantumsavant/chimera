@@ -1,0 +1,2 @@
+# CHIMERA has zero third-party runtime or test dependencies.
+# It uses only the Python 3.11+ standard library.

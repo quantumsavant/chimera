@@ -1,0 +1,1 @@
+"""CHIMERA automated test suite."""
