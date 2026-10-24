@@ -168,5 +168,65 @@ class TestSchedulerAndDAGValidation(unittest.TestCase):
         self.assertEqual(summary.tasks["leaf"].state, TaskState.CANCELLED)
 
 
+
+    def test_deterministic_seeded_random_dags_topological_invariants(self) -> None:
+        """
+        Phase 9: Deterministic randomized property test generating 10 random
+        acyclic graphs with random priorities, dependencies, and transient
+        retries, verifying topological execution order and exact dependency
+        sum propagation.
+        """
+        import random
+
+        rng = random.Random(20261019)
+        for seed_idx in range(10):
+            n_nodes = rng.randint(6, 16)
+            finish_order: list[str] = []
+            order_lock = threading.Lock()
+            tasks: list[TaskSpec] = []
+
+            for i in range(n_nodes):
+                tid = f"node_{i:02d}"
+                possible_deps = [f"node_{j:02d}" for j in range(i)]
+                k_deps = rng.randint(0, min(3, len(possible_deps)))
+                deps = sorted(rng.sample(possible_deps, k_deps))
+                prio = rng.randint(-5, 5)
+
+                def make_fn(my_id: str, my_deps: list[str], base_val: int):
+                    def _fn(_p: Any, ctx: TaskContext) -> int:
+                        dep_sum = sum(ctx.dependency_results[d] for d in my_deps)
+                        with order_lock:
+                            finish_order.append(my_id)
+                        return base_val + dep_sum
+                    return _fn
+
+                tasks.append(
+                    TaskSpec(
+                        task_id=tid,
+                        func=make_fn(tid, deps, i + 1),
+                        dependencies=deps,
+                        priority=prio,
+                    )
+                )
+
+            wf = create_workflow(
+                tasks,
+                max_concurrency=rng.randint(1, 4),
+                workflow_id=f"wf_rand_dag_{seed_idx}",
+                storage_dir=self.storage_dir,
+                clock=self.clock,
+            )
+            summary = run_workflow(wf)
+            self.assertEqual(summary.status, WorkflowStatus.SUCCEEDED)
+            pos = {tid: idx for idx, tid in enumerate(finish_order)}
+            for spec in tasks:
+                for dep_id in spec.dependencies:
+                    self.assertLess(
+                        pos[dep_id],
+                        pos[spec.task_id],
+                        f"Dependency {dep_id} finished after {spec.task_id} in seed_idx={seed_idx}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

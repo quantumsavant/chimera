@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import copy
-import json
 from pathlib import Path
 import tempfile
 import threading
@@ -14,40 +13,64 @@ from typing import Any, Callable, Iterator, Sequence
 import uuid
 
 from chimera.clock import Clock, SystemClock, VirtualClock
+from chimera.diagnostics import MetricsSink, NullMetricsSink
 from chimera.exceptions import (
     CorruptedStateTransitionError,
     InvalidStateTransitionError,
     LogCorruptionError,
+    MissingWorkflowDefinitionError,
+    OversizedPayloadError,
+    PayloadSerializationError,
+    ProcessWorkerCrashError,
     SimulatedProcessCrash,
+    TaskOutputLimitExceededError,
     WorkflowNotFoundError,
+    WorkflowShutdownError,
     WorkflowValidationError,
 )
-from chimera.locking import WorkflowFileLock
+from chimera.executor import ProcessTaskExecutor, TaskAttemptResult
+from chimera.locking import (
+    DEFAULT_FILE_MODE,
+    WorkflowFileLock,
+    ensure_private_directory,
+)
 from chimera.models import (
     LIVE_ALLOWED_TRANSITIONS,
     RECOVERY_ALLOWED_TRANSITIONS,
     TERMINAL_TASK_STATES,
     ClaimToken,
+    CompatibilityPolicy,
+    ExecutionBackend,
+    FailureCategory,
     StructuredLogEntry,
     TaskContext,
     TaskResultView,
     TaskRuntimeState,
     TaskSpec,
     TaskState,
+    WorkflowMetrics,
     WorkflowStatus,
     WorkflowStatusSummary,
+    compute_workflow_definition_hash,
 )
 from chimera.persistence import EventLog
 from chimera.recovery import RecoveryManager
 from chimera.scheduler import DeterministicReadyScheduler, invoke_task_callable
-from chimera.validation import validate_dag
+from chimera.serialization import (
+    DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    canonical_json_bytes,
+    canonical_json_loads,
+    validate_callable_for_process_backend,
+)
+from chimera.validation import validate_dag, validate_workflow_id
 
 
 class WorkflowEngine:
     """
     Fault-tolerant DAG workflow engine managing task state transitions, durable
-    event logging, fenced worker claims, timeouts, retries, cancellation, and
-    crash recovery.
+    event logging, fenced worker claims, thread and child-process execution
+    backends, timeouts, retries, cancellation, metrics, and crash recovery.
     """
 
     def __init__(
@@ -59,23 +82,78 @@ class WorkflowEngine:
         clock: Clock | None = None,
         crash_hook: Callable[[str, dict[str, Any], int], None] | None = None,
         partial_write_bytes: int | None = None,
+        *,
+        execution_backend: ExecutionBackend | str = ExecutionBackend.THREAD,
+        definition_version: int = 1,
+        compatibility_policy: CompatibilityPolicy | str = CompatibilityPolicy.STRICT,
+        max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+        max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+        max_output_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+        file_mode: int = DEFAULT_FILE_MODE,
+        hmac_key: bytes | None = None,
+        log_format_version: int | None = None,
+        metrics_sink: MetricsSink | None = None,
+        log_sensitive_payloads: bool = False,
+        process_grace_period_seconds: float = 0.03,
+        process_terminate_wait_seconds: float = 0.05,
     ) -> None:
         if max_concurrency < 1:
             raise WorkflowValidationError("max_concurrency must be >= 1.")
+        if definition_version < 1:
+            raise WorkflowValidationError("definition_version must be >= 1.")
+        if max_payload_bytes <= 0 or max_frame_bytes <= 0 or max_output_bytes <= 0:
+            raise WorkflowValidationError(
+                "max_payload_bytes, max_frame_bytes, and max_output_bytes must be > 0."
+            )
 
-        self.workflow_id: str = workflow_id or f"wf_{uuid.uuid4().hex[:12]}"
+        raw_wf_id = workflow_id if workflow_id is not None else f"wf_{uuid.uuid4().hex[:12]}"
+        self.workflow_id: str = validate_workflow_id(raw_wf_id)
         self.max_concurrency: int = int(max_concurrency)
+        self.definition_version: int = int(definition_version)
+        self.max_payload_bytes: int = int(max_payload_bytes)
+        self.max_frame_bytes: int = int(max_frame_bytes)
+        self.max_output_bytes: int = int(max_output_bytes)
+        self.file_mode: int = int(file_mode)
+        self.log_sensitive_payloads: bool = bool(log_sensitive_payloads)
+        self._process_grace_period_seconds = float(process_grace_period_seconds)
+        self._process_terminate_wait_seconds = float(process_terminate_wait_seconds)
+
+        try:
+            self.execution_backend: ExecutionBackend = (
+                execution_backend
+                if isinstance(execution_backend, ExecutionBackend)
+                else ExecutionBackend(str(execution_backend).upper())
+            )
+        except ValueError as exc:
+            raise WorkflowValidationError(
+                f"Invalid execution_backend: {execution_backend!r}"
+            ) from exc
+
+        try:
+            self.compatibility_policy: CompatibilityPolicy = (
+                compatibility_policy
+                if isinstance(compatibility_policy, CompatibilityPolicy)
+                else CompatibilityPolicy(str(compatibility_policy).upper())
+            )
+        except ValueError as exc:
+            raise WorkflowValidationError(
+                f"Invalid compatibility_policy: {compatibility_policy!r}"
+            ) from exc
+
         self._raw_tasks: list[TaskSpec] = list(tasks)
         self._clock: Clock = clock or SystemClock()
+        self._metrics_sink: MetricsSink = metrics_sink or NullMetricsSink()
 
         if storage_dir is None:
             storage_dir = Path(tempfile.gettempdir()) / "chimera_workflows"
         self.storage_dir: Path = Path(storage_dir)
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.storage_dir)
         self.log_path: Path = self.storage_dir / f"{self.workflow_id}.chimera.log"
         self.lock_path: Path = self.storage_dir / f"{self.workflow_id}.chimera.lock"
 
-        self._file_lock = WorkflowFileLock(self.lock_path, self.workflow_id)
+        self._file_lock = WorkflowFileLock(
+            self.lock_path, self.workflow_id, file_mode=self.file_mode
+        )
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         if isinstance(self._clock, VirtualClock):
@@ -88,26 +166,50 @@ class WorkflowEngine:
             crash_hook=crash_hook,
             file_lock=self._file_lock,
             partial_write_bytes=partial_write_bytes,
+            max_payload_bytes=self.max_payload_bytes,
+            max_frame_bytes=self.max_frame_bytes,
+            file_mode=self.file_mode,
+            hmac_key=hmac_key,
+            format_version=log_format_version,
         )
 
         self._task_specs: dict[str, TaskSpec] = {}
         self._dependents: dict[str, list[str]] = {}
         self._task_states: dict[str, TaskRuntimeState] = {}
         self._scheduler = DeterministicReadyScheduler()
+        self._definition_hash: str = ""
 
         self._global_claim_epoch: int = 0
         self._active_cancel_events: dict[tuple[str, int], threading.Event] = {}
+        self._process_executor: ProcessTaskExecutor | None = None
 
         self._validated: bool = False
         self._initialized_in_log: bool = False
+        self._shut_down: bool = False
         self._status: WorkflowStatus = WorkflowStatus.CREATED
         self._cancel_requested: bool = False
         self._truncated_tail_repaired: bool = False
         self._structured_logs: list[StructuredLogEntry] = []
 
+        # Aggregate operational counters
+        self._succeeded_count: int = 0
+        self._failed_count: int = 0
+        self._cancelled_count: int = 0
+        self._stale_completion_count: int = 0
+        self._recovery_event_count: int = 0
+        self._timeout_event_count: int = 0
+        self._worker_crash_count: int = 0
+        self._retry_scheduled_count: int = 0
+
         # Deterministic test hooks
         self.on_task_claimed_hook: Callable[[ClaimToken], None] | None = None
         self.before_task_commit_hook: Callable[[ClaimToken, str], None] | None = None
+
+    def __enter__(self) -> WorkflowEngine:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.shutdown(force=True)
 
     @contextmanager
     def lock_workflow(self) -> Iterator[None]:
@@ -115,14 +217,52 @@ class WorkflowEngine:
         with self._file_lock.acquire():
             yield
 
+    def _effective_backend_for_task(self, spec: TaskSpec) -> ExecutionBackend:
+        if spec.execution_backend is not None:
+            return (
+                spec.execution_backend
+                if isinstance(spec.execution_backend, ExecutionBackend)
+                else ExecutionBackend(str(spec.execution_backend).upper())
+            )
+        return self.execution_backend
+
+    def _get_or_create_process_executor(self) -> ProcessTaskExecutor:
+        with self._lock:
+            if self._process_executor is None:
+                self._process_executor = ProcessTaskExecutor(
+                    max_workers=self.max_concurrency,
+                    default_max_output_bytes=self.max_output_bytes,
+                    grace_period_seconds=self._process_grace_period_seconds,
+                    terminate_wait_seconds=self._process_terminate_wait_seconds,
+                    on_attempt_completed=self._on_process_attempt_completed,
+                )
+            return self._process_executor
+
+    def active_process_count(self) -> int:
+        """Return the number of currently alive child worker processes."""
+        with self._lock:
+            if self._process_executor is None:
+                return 0
+            return self._process_executor.active_process_count()
+
     # ------------------------------------------------------------------
     # Validation & Initialization
     # ------------------------------------------------------------------
 
     def validate(self) -> bool:
-        """Validate the workflow DAG and initialize graph adjacency maps."""
+        """Validate the workflow DAG, process callables, and canonical definition hash."""
         with self._lock:
             self._task_specs = validate_dag(self._raw_tasks)
+            for tid, spec in self._task_specs.items():
+                if self._effective_backend_for_task(spec) == ExecutionBackend.PROCESS:
+                    validate_callable_for_process_backend(spec.func, tid)
+                canonical_json_bytes(
+                    spec.input_payload, max_bytes=self.max_payload_bytes
+                )
+
+            self._definition_hash = compute_workflow_definition_hash(
+                self._task_specs, definition_version=self.definition_version
+            )
             self._dependents = {tid: [] for tid in self._task_specs}
             for tid, spec in self._task_specs.items():
                 for dep_id in spec.dependencies:
@@ -155,6 +295,10 @@ class WorkflowEngine:
             rec = self._event_log.append(
                 "WORKFLOW_CREATED",
                 {
+                    "schema_version": 2,
+                    "definition_version": self.definition_version,
+                    "definition_hash": self._definition_hash,
+                    "execution_backend": self.execution_backend.value,
                     "max_concurrency": self.max_concurrency,
                     "tasks": spec_metadata,
                 },
@@ -179,7 +323,7 @@ class WorkflowEngine:
 
     def _apply_event(
         self, record: dict[str, Any], is_recovery: bool = False
-    ) -> None:
+    ) -> DefinitionVerificationResult | None:
         """
         Deterministically apply a single committed event log record to in-memory
         workflow state. Enforces strict structural and state-transition invariants.
@@ -199,9 +343,15 @@ class WorkflowEngine:
                 data.get("max_concurrency", self.max_concurrency)
             )
             tasks_meta = data.get("tasks", {})
-            RecoveryManager.verify_recovered_task_specs(
-                self.workflow_id, self._task_specs, tasks_meta, seq
+            ver_res = RecoveryManager.verify_recovered_task_specs(
+                self.workflow_id,
+                self._task_specs,
+                data,
+                seq,
+                definition_version=self.definition_version,
+                compatibility_policy=self.compatibility_policy,
             )
+            self._definition_hash = ver_res.definition_hash
 
             for tid in sorted(tasks_meta.keys()):
                 if tid not in self._task_states:
@@ -224,15 +374,45 @@ class WorkflowEngine:
                     from_state=None,
                     to_state=WorkflowStatus.RUNNING.value,
                     reason="WORKFLOW_INITIALIZED",
-                    details={"task_count": len(tasks_meta)},
+                    failure_category=FailureCategory.NONE.value,
+                    details={
+                        "task_count": len(tasks_meta),
+                        "definition_version": ver_res.definition_version,
+                        "definition_hash": ver_res.definition_hash,
+                    },
                 )
             )
-            return
+            return ver_res
 
         if not self._initialized_in_log:
             raise CorruptedStateTransitionError(
                 f"Event '{etype}' at seq={seq} appeared before WORKFLOW_CREATED."
             )
+
+        if etype == "DEFINITION_MIGRATED":
+            self.definition_version = int(
+                data.get("to_definition_version", self.definition_version)
+            )
+            self._definition_hash = str(
+                data.get("to_definition_hash", self._definition_hash)
+            )
+            self._structured_logs.append(
+                StructuredLogEntry(
+                    seq=seq,
+                    timestamp=ts,
+                    workflow_id=self.workflow_id,
+                    event_type=etype,
+                    task_id=None,
+                    attempt=None,
+                    claim_epoch=None,
+                    from_state=self._status.value,
+                    to_state=self._status.value,
+                    reason=str(data.get("reason", "DEFINITION_MIGRATED")),
+                    failure_category=FailureCategory.NONE.value,
+                    details=copy.deepcopy(data),
+                )
+            )
+            return None
 
         if etype == "WORKFLOW_CANCEL_REQUESTED":
             self._cancel_requested = True
@@ -249,9 +429,10 @@ class WorkflowEngine:
                     from_state=self._status.value,
                     to_state=WorkflowStatus.CANCELLED.value,
                     reason=reason,
+                    failure_category=FailureCategory.CANCELLED.value,
                 )
             )
-            return
+            return None
 
         if etype == "WORKFLOW_COMPLETED":
             try:
@@ -275,9 +456,10 @@ class WorkflowEngine:
                     from_state=old_status,
                     to_state=new_status.value,
                     reason=reason,
+                    failure_category=FailureCategory.NONE.value,
                 )
             )
-            return
+            return None
 
         if etype == "STALE_COMPLETION_IGNORED":
             tid = str(data.get("task_id", ""))
@@ -285,6 +467,12 @@ class WorkflowEngine:
                 raise CorruptedStateTransitionError(
                     f"Unknown task_id '{tid}' in STALE_COMPLETION_IGNORED at seq={seq}."
                 )
+            self._stale_completion_count += 1
+            self._metrics_sink.inc_counter(
+                "chimera.task.stale_completion",
+                1,
+                {"event_type": etype, "task_id": tid},
+            )
             self._structured_logs.append(
                 StructuredLogEntry(
                     seq=seq,
@@ -297,10 +485,11 @@ class WorkflowEngine:
                     from_state=data.get("current_state"),
                     to_state=data.get("current_state"),
                     reason=str(data.get("reason", "STALE_WORKER_TOKEN")),
-                    details=dict(data),
+                    failure_category=FailureCategory.NONE.value,
+                    details=copy.deepcopy(data),
                 )
             )
-            return
+            return None
 
         if etype == "TASK_STATE_CHANGED":
             if self._status in (
@@ -383,11 +572,43 @@ class WorkflowEngine:
                     )
                 rt.recovery_count = rec_cnt
 
+            cat_str = str(
+                data.get("failure_category", FailureCategory.NONE.value)
+            )
+            try:
+                failure_cat = FailureCategory(cat_str)
+            except ValueError:
+                failure_cat = FailureCategory.NONE
+
             rt.state = to_state
             rt.last_transition_reason = reason
             rt.last_updated_at = ts
+            rt.failure_category = failure_cat
+
+            if "worker_pid" in data and data["worker_pid"] is not None:
+                rt.worker_pid = int(data["worker_pid"])
+            if "exit_code" in data and data["exit_code"] is not None:
+                rt.exit_code = int(data["exit_code"])
+
+            if reason == "RECOVERED_FROM_CRASH":
+                self._recovery_event_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.workflow.recovered", 1, {"task_id": tid}
+                )
+            if "TIMEOUT" in reason or failure_cat == FailureCategory.TIMEOUT:
+                rt.timeout_count += 1
+                self._timeout_event_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.task.timed_out", 1, {"task_id": tid}
+                )
+            if failure_cat == FailureCategory.PROCESS_CRASH:
+                self._worker_crash_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.worker.crash", 1, {"task_id": tid}
+                )
 
             if to_state == TaskState.READY:
+                rt.ready_at = ts
                 rt.started_at = None
                 rt.deadline_at = None
                 rt.wake_at = None
@@ -402,11 +623,35 @@ class WorkflowEngine:
                 self._scheduler.discard(tid)
 
             if to_state == TaskState.RUNNING:
-                rt.started_at = data.get("started_at", ts)
+                started_val = float(data.get("started_at", ts))
+                if rt.ready_at is not None:
+                    q_delay = max(0.0, started_val - rt.ready_at)
+                    rt.queue_delay_seconds = q_delay
+                    self._metrics_sink.observe_duration(
+                        "chimera.task.queue_delay_seconds",
+                        q_delay,
+                        {"task_id": tid},
+                    )
+                rt.started_at = started_val
                 rt.deadline_at = data.get("deadline_at")
                 rt.worker_id = data.get("worker_id")
                 rt.wake_at = None
             elif to_state == TaskState.RETRY_WAIT:
+                if rt.started_at is not None:
+                    exec_dur = max(0.0, ts - rt.started_at)
+                    rt.execution_duration_seconds = exec_dur
+                    self._metrics_sink.observe_duration(
+                        "chimera.task.execution_duration_seconds",
+                        exec_dur,
+                        {"task_id": tid, "to_state": to_state.value},
+                    )
+                rt.retry_count += 1
+                self._retry_scheduled_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.task.retried",
+                    1,
+                    {"task_id": tid, "failure_category": failure_cat.value},
+                )
                 rt.started_at = None
                 rt.deadline_at = None
                 rt.worker_id = None
@@ -414,6 +659,15 @@ class WorkflowEngine:
                 rt.error_type = data.get("error_type")
                 rt.error_message = data.get("error_message")
             elif to_state == TaskState.SUCCEEDED:
+                if rt.started_at is not None:
+                    exec_dur = max(0.0, ts - rt.started_at)
+                    rt.execution_duration_seconds = exec_dur
+                    self._metrics_sink.observe_duration(
+                        "chimera.task.execution_duration_seconds",
+                        exec_dur,
+                        {"task_id": tid, "to_state": to_state.value},
+                    )
+                rt.completed_at = ts
                 rt.started_at = None
                 rt.deadline_at = None
                 rt.wake_at = None
@@ -421,13 +675,37 @@ class WorkflowEngine:
                 rt.has_result = True
                 rt.error_type = None
                 rt.error_message = None
+                rt.failure_category = FailureCategory.NONE
+                self._succeeded_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.task.succeeded", 1, {"task_id": tid}
+                )
             elif to_state == TaskState.FAILED:
+                if rt.started_at is not None:
+                    exec_dur = max(0.0, ts - rt.started_at)
+                    rt.execution_duration_seconds = exec_dur
+                    self._metrics_sink.observe_duration(
+                        "chimera.task.execution_duration_seconds",
+                        exec_dur,
+                        {"task_id": tid, "to_state": to_state.value},
+                    )
+                rt.completed_at = ts
                 rt.started_at = None
                 rt.deadline_at = None
                 rt.wake_at = None
                 rt.error_type = data.get("error_type")
                 rt.error_message = data.get("error_message")
+                self._failed_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.task.failed",
+                    1,
+                    {"task_id": tid, "failure_category": failure_cat.value},
+                )
             elif to_state == TaskState.CANCELLED:
+                if rt.started_at is not None:
+                    exec_dur = max(0.0, ts - rt.started_at)
+                    rt.execution_duration_seconds = exec_dur
+                rt.completed_at = ts
                 rt.started_at = None
                 rt.deadline_at = None
                 rt.wake_at = None
@@ -435,6 +713,42 @@ class WorkflowEngine:
                     rt.error_type = data.get("error_type")
                 if data.get("error_message"):
                     rt.error_message = data.get("error_message")
+                self._cancelled_count += 1
+                self._metrics_sink.inc_counter(
+                    "chimera.task.cancelled", 1, {"task_id": tid}
+                )
+
+            log_details: dict[str, Any] = {}
+            for k, v in data.items():
+                if k in {
+                    "task_id",
+                    "from_state",
+                    "to_state",
+                    "reason",
+                    "attempt",
+                    "claim_epoch",
+                    "failure_category",
+                }:
+                    continue
+                if k == "result" and not self.log_sensitive_payloads:
+                    log_details["has_result"] = True
+                    log_details["result_type"] = type(v).__name__
+                else:
+                    log_details[k] = copy.deepcopy(v)
+
+            if rt.queue_delay_seconds is not None:
+                log_details.setdefault(
+                    "queue_delay_seconds", rt.queue_delay_seconds
+                )
+            if rt.execution_duration_seconds is not None and to_state in (
+                TaskState.SUCCEEDED,
+                TaskState.FAILED,
+                TaskState.RETRY_WAIT,
+            ):
+                log_details.setdefault(
+                    "execution_duration_seconds",
+                    rt.execution_duration_seconds,
+                )
 
             self._structured_logs.append(
                 StructuredLogEntry(
@@ -448,22 +762,11 @@ class WorkflowEngine:
                     from_state=from_state.value,
                     to_state=to_state.value,
                     reason=reason,
-                    details={
-                        k: v
-                        for k, v in data.items()
-                        if k
-                        not in {
-                            "task_id",
-                            "from_state",
-                            "to_state",
-                            "reason",
-                            "attempt",
-                            "claim_epoch",
-                        }
-                    },
+                    failure_category=failure_cat.value,
+                    details=log_details,
                 )
             )
-            return
+            return None
 
         raise LogCorruptionError(f"Unknown event_type '{etype}' at seq={seq}.")
 
@@ -484,13 +787,22 @@ class WorkflowEngine:
         deadline_at: float | None = None,
         wake_at: float | None = None,
         worker_id: str | None = None,
+        worker_pid: int | None = None,
+        exit_code: int | None = None,
         result: Any = None,
         include_result: bool = False,
         error_type: str | None = None,
         error_message: str | None = None,
+        failure_category: FailureCategory = FailureCategory.NONE,
     ) -> None:
         """Persist a task state transition to EventLog and apply it atomically."""
         rt = self._task_states[task_id]
+        spec = self._task_specs.get(task_id)
+        max_out = (
+            spec.max_output_bytes
+            if (spec is not None and spec.max_output_bytes is not None)
+            else self.max_output_bytes
+        )
         payload: dict[str, Any] = {
             "task_id": task_id,
             "from_state": rt.state.value,
@@ -502,6 +814,8 @@ class WorkflowEngine:
                 rt.recovery_count if recovery_count is None else recovery_count
             ),
         }
+        if failure_category != FailureCategory.NONE:
+            payload["failure_category"] = failure_category.value
         if started_at is not None:
             payload["started_at"] = started_at
         if deadline_at is not None:
@@ -510,8 +824,16 @@ class WorkflowEngine:
             payload["wake_at"] = wake_at
         if worker_id is not None:
             payload["worker_id"] = worker_id
+        if worker_pid is not None:
+            payload["worker_pid"] = worker_pid
+        if exit_code is not None:
+            payload["exit_code"] = exit_code
         if include_result:
-            payload["result"] = self._make_json_safe(result)
+            # Strict lossless canonical JSON validation (raises PayloadSerializationError / TaskOutputLimitExceededError)
+            encoded_res = canonical_json_bytes(
+                result, max_bytes=max_out, is_task_output=True
+            )
+            payload["result"] = canonical_json_loads(encoded_res, max_bytes=None)
         if error_type is not None:
             payload["error_type"] = error_type
         if error_message is not None:
@@ -521,16 +843,6 @@ class WorkflowEngine:
         self._apply_event(
             rec, is_recovery=(reason == "RECOVERED_FROM_CRASH")
         )
-        if include_result:
-            self._task_states[task_id].result = copy.deepcopy(result)
-
-    @staticmethod
-    def _make_json_safe(val: Any) -> Any:
-        try:
-            json.dumps(val)
-            return copy.deepcopy(val)
-        except (TypeError, OverflowError):
-            return repr(val)
 
     def _promote_eligible_pending_tasks(self, reason: str) -> list[str]:
         if self._cancel_requested:
@@ -562,6 +874,7 @@ class WorkflowEngine:
                     claim_epoch=self._global_claim_epoch,
                     error_type="DependencyFailedError",
                     error_message=f"Upstream dependency '{failed_task_id}' failed.",
+                    failure_category=FailureCategory.DEPENDENCY_FAILED,
                 )
                 cancelled_ids.append(tid)
         return cancelled_ids
@@ -625,7 +938,7 @@ class WorkflowEngine:
     ) -> tuple[ClaimToken, TaskSpec, Any, TaskContext] | None:
         """Atomically attempt to claim a specific `READY` task for `worker_id`."""
         with self._file_lock.acquire(), self._cond:
-            if self._cancel_requested:
+            if self._cancel_requested or self._shut_down:
                 return None
             if self._active_running_count() >= self.max_concurrency:
                 return None
@@ -640,7 +953,7 @@ class WorkflowEngine:
     ) -> tuple[ClaimToken, TaskSpec, Any, TaskContext] | None:
         """Atomically pop and claim the next deterministic `READY` task if concurrency allows."""
         with self._file_lock.acquire(), self._cond:
-            if self._cancel_requested:
+            if self._cancel_requested or self._shut_down:
                 return None
             if self._active_running_count() >= self.max_concurrency:
                 return None
@@ -698,14 +1011,17 @@ class WorkflowEngine:
             dep_id: copy.deepcopy(self._task_states[dep_id].result)
             for dep_id in spec.dependencies
         }
+        idem_key = spec.resolve_idempotency_key(self.workflow_id)
         ctx = TaskContext(
             workflow_id=self.workflow_id,
             task_id=task_id,
             attempt=new_attempt,
             claim_epoch=new_epoch,
-            idempotency_key=f"{self.workflow_id}:{task_id}",
+            idempotency_key=idem_key,
             dependency_results=dep_results,
             _cancel_event=cancel_event,
+            operation_key=spec.operation_key or idem_key,
+            attempt_idempotency_key=f"{idem_key}:attempt:{new_attempt}:epoch:{new_epoch}",
         )
         return token, spec, isolated_payload, ctx
 
@@ -716,6 +1032,9 @@ class WorkflowEngine:
         succeeded: bool,
         result: Any = None,
         exception: BaseException | None = None,
+        failure_category: FailureCategory | None = None,
+        worker_pid: int | None = None,
+        exit_code: int | None = None,
     ) -> bool:
         """Atomically commit the outcome of a worker's task execution attempt."""
         if self.before_task_commit_hook is not None:
@@ -729,6 +1048,9 @@ class WorkflowEngine:
                 succeeded=succeeded,
                 result=result,
                 exception=exception,
+                failure_category=failure_category,
+                worker_pid=worker_pid,
+                exit_code=exit_code,
             )
 
     def _complete_task_attempt_locked(
@@ -738,6 +1060,9 @@ class WorkflowEngine:
         succeeded: bool,
         result: Any = None,
         exception: BaseException | None = None,
+        failure_category: FailureCategory | None = None,
+        worker_pid: int | None = None,
+        exit_code: int | None = None,
     ) -> bool:
         rt = self._task_states.get(token.task_id)
         if rt is None:
@@ -773,24 +1098,69 @@ class WorkflowEngine:
         spec = self._task_specs[token.task_id]
 
         if succeeded:
-            self._record_task_transition(
-                token.task_id,
-                TaskState.SUCCEEDED,
-                reason="EXECUTION_SUCCEEDED",
-                result=result,
-                include_result=True,
-            )
-            self._promote_eligible_pending_tasks(
-                reason=f"DEPENDENCY_SUCCEEDED:{token.task_id}"
-            )
-            self._check_and_finalize_workflow()
-            self._cond.notify_all()
-            return True
+            try:
+                self._record_task_transition(
+                    token.task_id,
+                    TaskState.SUCCEEDED,
+                    reason="EXECUTION_SUCCEEDED",
+                    result=result,
+                    include_result=True,
+                    worker_pid=worker_pid,
+                    exit_code=exit_code,
+                    failure_category=FailureCategory.NONE,
+                )
+                self._promote_eligible_pending_tasks(
+                    reason=f"DEPENDENCY_SUCCEEDED:{token.task_id}"
+                )
+                self._check_and_finalize_workflow()
+                self._cond.notify_all()
+                return True
+            except (
+                PayloadSerializationError,
+                OversizedPayloadError,
+                TaskOutputLimitExceededError,
+            ) as ser_exc:
+                # Output violates the durable serialization contract -> treat as non-retryable serialization failure
+                exception = ser_exc
+                succeeded = False
+                failure_category = FailureCategory.SERIALIZATION_ERROR
 
         assert exception is not None
         err_type = type(exception).__name__
         err_msg = str(exception)
-        is_retryable = isinstance(exception, spec.retryable_exceptions)
+
+        if failure_category is None:
+            if isinstance(exception, ProcessWorkerCrashError):
+                failure_category = FailureCategory.PROCESS_CRASH
+            elif isinstance(
+                exception,
+                (
+                    PayloadSerializationError,
+                    OversizedPayloadError,
+                    TaskOutputLimitExceededError,
+                ),
+            ):
+                failure_category = FailureCategory.SERIALIZATION_ERROR
+            else:
+                failure_category = FailureCategory.APPLICATION_ERROR
+
+        # Serialization errors are deterministic contract violations and never retried unless explicitly listed
+        if isinstance(
+            exception,
+            (
+                PayloadSerializationError,
+                OversizedPayloadError,
+                TaskOutputLimitExceededError,
+            ),
+        ) and not any(
+            issubclass(cls, PayloadSerializationError)
+            for cls in spec.retryable_exceptions
+            if cls is not Exception and cls is not BaseException
+        ):
+            is_retryable = False
+        else:
+            is_retryable = isinstance(exception, spec.retryable_exceptions)
+
         retries_used = rt.attempt - 1
 
         if (
@@ -798,15 +1168,20 @@ class WorkflowEngine:
             and is_retryable
             and retries_used < spec.max_retries
         ):
-            backoff = spec.compute_backoff(rt.attempt)
+            backoff = spec.compute_backoff(
+                rt.attempt, workflow_id=self.workflow_id
+            )
             wake_at = self._clock.now() + backoff
             self._record_task_transition(
                 token.task_id,
                 TaskState.RETRY_WAIT,
                 reason=f"RETRYABLE_ERROR:{err_type}",
                 wake_at=wake_at,
+                worker_pid=worker_pid,
+                exit_code=exit_code,
                 error_type=err_type,
                 error_message=err_msg,
+                failure_category=failure_category,
             )
         else:
             reason = (
@@ -818,8 +1193,11 @@ class WorkflowEngine:
                 token.task_id,
                 TaskState.FAILED,
                 reason=reason,
+                worker_pid=worker_pid,
+                exit_code=exit_code,
                 error_type=err_type,
                 error_message=err_msg,
+                failure_category=failure_category,
             )
             self._cascade_dependency_failure(token.task_id)
             self._check_and_finalize_workflow()
@@ -827,10 +1205,29 @@ class WorkflowEngine:
         self._cond.notify_all()
         return True
 
+    def _on_process_attempt_completed(
+        self, outcome: TaskAttemptResult
+    ) -> None:
+        """Callback invoked by ProcessTaskExecutor monitor thread when a child process finishes."""
+        try:
+            self.complete_task_attempt(
+                outcome.token,
+                succeeded=outcome.succeeded,
+                result=outcome.result,
+                exception=outcome.exception,
+                failure_category=outcome.failure_category,
+                worker_pid=outcome.worker_pid,
+                exit_code=outcome.exit_code,
+            )
+        except BaseException:
+            with self._cond:
+                self._cond.notify_all()
+
     def _enforce_timeouts_and_timers_locked(self) -> tuple[int, float | None]:
         now = self._clock.now()
         timed_out_count = 0
         next_wake: float | None = None
+        processes_to_terminate: list[tuple[str, int]] = []
 
         for tid in sorted(self._task_states.keys()):
             rt = self._task_states[tid]
@@ -844,6 +1241,8 @@ class WorkflowEngine:
                     ev.set()
 
                 spec = self._task_specs[tid]
+                # Step 1: Durably fence the expired attempt FIRST before terminating
+                # the process or allowing any replacement attempt to start.
                 self._global_claim_epoch += 1
                 new_epoch = self._global_claim_epoch
                 retries_used = rt.attempt - 1
@@ -857,7 +1256,9 @@ class WorkflowEngine:
                     and spec.retry_on_timeout
                     and retries_used < spec.max_retries
                 ):
-                    backoff = spec.compute_backoff(rt.attempt)
+                    backoff = spec.compute_backoff(
+                        rt.attempt, workflow_id=self.workflow_id
+                    )
                     wake_at = now + backoff
                     self._record_task_transition(
                         tid,
@@ -867,6 +1268,7 @@ class WorkflowEngine:
                         wake_at=wake_at,
                         error_type="TaskTimeoutError",
                         error_message=err_msg,
+                        failure_category=FailureCategory.TIMEOUT,
                     )
                 else:
                     self._record_task_transition(
@@ -876,8 +1278,12 @@ class WorkflowEngine:
                         claim_epoch=new_epoch,
                         error_type="TaskTimeoutError",
                         error_message=err_msg,
+                        failure_category=FailureCategory.TIMEOUT,
                     )
                     self._cascade_dependency_failure(tid)
+
+                if self._effective_backend_for_task(spec) == ExecutionBackend.PROCESS:
+                    processes_to_terminate.append((tid, old_epoch))
             else:
                 rem = rt.deadline_at - now
                 if next_wake is None or rem < next_wake:
@@ -894,6 +1300,7 @@ class WorkflowEngine:
                     TaskState.CANCELLED,
                     reason="WORKFLOW_CANCELLED",
                     claim_epoch=self._global_claim_epoch,
+                    failure_category=FailureCategory.CANCELLED,
                 )
                 continue
             wake_at = rt.wake_at if rt.wake_at is not None else now
@@ -909,10 +1316,16 @@ class WorkflowEngine:
                     next_wake = rem
 
         self._check_and_finalize_workflow()
+
+        # Step 2: Terminate and reap timed-out child processes
+        if processes_to_terminate and self._process_executor is not None:
+            for tid, old_epoch in processes_to_terminate:
+                self._process_executor.terminate_attempt(tid, old_epoch)
+
         return timed_out_count, next_wake
 
     # ------------------------------------------------------------------
-    # Cancellation
+    # Cancellation & Shutdown
     # ------------------------------------------------------------------
 
     def cancel(
@@ -920,8 +1333,9 @@ class WorkflowEngine:
     ) -> WorkflowStatusSummary:
         """
         Request workflow cancellation without overwriting a completed workflow's
-        terminal status.
+        terminal status. Terminates any active child worker processes.
         """
+        processes_to_terminate: list[tuple[str, int]] = []
         with self._file_lock.acquire(), self._cond:
             if not self._initialized_in_log:
                 self._ensure_initialized_in_log()
@@ -935,8 +1349,9 @@ class WorkflowEngine:
                 )
                 self._apply_event(rec, is_recovery=False)
 
-            for (_tid, _epoch), ev in list(self._active_cancel_events.items()):
+            for (tid, epoch), ev in list(self._active_cancel_events.items()):
                 ev.set()
+                processes_to_terminate.append((tid, epoch))
             self._active_cancel_events.clear()
 
             for tid in sorted(self._task_states.keys()):
@@ -948,11 +1363,40 @@ class WorkflowEngine:
                         TaskState.CANCELLED,
                         reason=reason,
                         claim_epoch=self._global_claim_epoch,
+                        failure_category=FailureCategory.CANCELLED,
                     )
 
             self._check_and_finalize_workflow()
             self._cond.notify_all()
-            return self.get_status()
+
+        if processes_to_terminate and self._process_executor is not None:
+            for tid, epoch in processes_to_terminate:
+                self._process_executor.terminate_attempt(tid, epoch)
+
+        return self.get_status()
+
+    def shutdown(
+        self,
+        *,
+        grace_period_seconds: float = 0.05,
+        force: bool = True,
+    ) -> None:
+        """
+        Cleanly shut down execution backends, signaling active workers and
+        reaping any child worker processes so unresponsive children never block
+        process exit.
+        """
+        with self._cond:
+            self._shut_down = True
+            for (_tid, _epoch), ev in list(self._active_cancel_events.items()):
+                ev.set()
+            proc_exec = self._process_executor
+            self._cond.notify_all()
+
+        if proc_exec is not None:
+            proc_exec.shutdown(
+                grace_period_seconds=grace_period_seconds, force=force
+            )
 
     # ------------------------------------------------------------------
     # Execution Loop
@@ -965,6 +1409,10 @@ class WorkflowEngine:
         """
         with self._file_lock.acquire():
             with self._cond:
+                if self._shut_down:
+                    raise WorkflowShutdownError(
+                        f"WorkflowEngine '{self.workflow_id}' has been shut down."
+                    )
                 self._ensure_initialized_in_log()
                 if self._check_and_finalize_workflow():
                     return self.get_status()
@@ -1008,7 +1456,12 @@ class WorkflowEngine:
                             )
                         if not committed:
                             break
-                        claim = self.claim_next_ready_task(token.worker_id)
+                        next_claim = self.claim_next_ready_task(token.worker_id)
+                        if next_claim is not None and self._effective_backend_for_task(next_claim[1]) == ExecutionBackend.PROCESS:
+                            # Dispatch process task via main loop / process executor
+                            self._dispatch_process_claim(next_claim)
+                            break
+                        claim = next_claim
                     else:
                         if self.before_task_commit_hook is not None:
                             self.before_task_commit_hook(
@@ -1024,7 +1477,11 @@ class WorkflowEngine:
                             )
                             if not committed:
                                 break
-                            claim = self.claim_next_ready_task(token.worker_id)
+                            next_claim = self.claim_next_ready_task(token.worker_id)
+                            if next_claim is not None and self._effective_backend_for_task(next_claim[1]) == ExecutionBackend.PROCESS:
+                                self._dispatch_process_claim(next_claim)
+                                break
+                            claim = next_claim
 
             crash_exc: BaseException | None = None
             worker_crash_lock = threading.Lock()
@@ -1042,62 +1499,98 @@ class WorkflowEngine:
                     with self._cond:
                         self._cond.notify_all()
 
-            with self._cond:
-                while True:
-                    if crash_exc is not None:
-                        raise crash_exc
-
-                    _, next_wait = self._enforce_timeouts_and_timers_locked()
-
-                    if self._check_and_finalize_workflow():
-                        break
-
-                    while (
-                        not self._cancel_requested
-                        and self._active_running_count() < self.max_concurrency
-                        and self._scheduler.has_ready()
-                    ):
-                        worker_seq += 1
-                        worker_id = f"worker-{worker_seq}"
-                        claim = self.claim_next_ready_task(worker_id)
-                        if claim is None:
+            try:
+                with self._cond:
+                    while True:
+                        if crash_exc is not None:
+                            raise crash_exc
+                        if self._shut_down:
                             break
-                        t = threading.Thread(
-                            target=_guarded_worker,
-                            args=(claim,),
-                            name=f"{self.workflow_id}-{worker_id}",
-                            daemon=True,
-                        )
-                        active_threads.append(t)
-                        t.start()
 
-                    if self._check_and_finalize_workflow():
-                        break
+                        _, next_wait = self._enforce_timeouts_and_timers_locked()
 
-                    _, next_wait = self._enforce_timeouts_and_timers_locked()
-                    if self._check_and_finalize_workflow():
-                        break
+                        if self._check_and_finalize_workflow():
+                            break
 
-                    if (
-                        isinstance(self._clock, VirtualClock)
-                        and self._clock.auto_advance_on_wait
-                        and self._active_running_count() == 0
-                        and not self._scheduler.has_ready()
-                        and next_wait is not None
-                        and next_wait > 0
-                    ):
-                        self._clock.advance(next_wait)
-                        continue
+                        while (
+                            not self._cancel_requested
+                            and not self._shut_down
+                            and self._active_running_count() < self.max_concurrency
+                            and self._scheduler.has_ready()
+                        ):
+                            worker_seq += 1
+                            worker_id = f"worker-{worker_seq}"
+                            claim = self.claim_next_ready_task(worker_id)
+                            if claim is None:
+                                break
+                            token, spec, _payload, _ctx = claim
+                            if self._effective_backend_for_task(spec) == ExecutionBackend.PROCESS:
+                                self._dispatch_process_claim(claim)
+                            else:
+                                t = threading.Thread(
+                                    target=_guarded_worker,
+                                    args=(claim,),
+                                    name=f"{self.workflow_id}-{worker_id}",
+                                    daemon=True,
+                                )
+                                active_threads.append(t)
+                                t.start()
 
-                    self._clock.wait_condition(self._cond, timeout=next_wait)
+                        if self._check_and_finalize_workflow():
+                            break
 
-            for t in active_threads:
-                t.join(timeout=0.02)
+                        _, next_wait = self._enforce_timeouts_and_timers_locked()
+                        if self._check_and_finalize_workflow():
+                            break
+
+                        if (
+                            isinstance(self._clock, VirtualClock)
+                            and self._clock.auto_advance_on_wait
+                            and self._active_running_count() == 0
+                            and not self._scheduler.has_ready()
+                            and next_wait is not None
+                            and next_wait > 0
+                        ):
+                            self._clock.advance(next_wait)
+                            continue
+
+                        effective_wait = next_wait
+                        if self._process_executor is not None and self._active_running_count() > 0:
+                            effective_wait = 0.05 if effective_wait is None else min(effective_wait, 0.05)
+                        self._clock.wait_condition(self._cond, timeout=effective_wait)
+            finally:
+                for t in active_threads:
+                    t.join(timeout=0.02)
+                if self._process_executor is not None and self._status in (
+                    WorkflowStatus.SUCCEEDED,
+                    WorkflowStatus.FAILED,
+                    WorkflowStatus.CANCELLED,
+                ):
+                    self._process_executor.shutdown(
+                        grace_period_seconds=self._process_grace_period_seconds,
+                        force=True,
+                    )
+                    self._process_executor = None
 
             if crash_exc is not None:
                 raise crash_exc
 
             return self.get_status()
+
+    def _dispatch_process_claim(
+        self, claim: tuple[ClaimToken, TaskSpec, Any, TaskContext]
+    ) -> None:
+        token, spec, payload, ctx = claim
+        if self.on_task_claimed_hook is not None:
+            self.on_task_claimed_hook(token)
+        proc_exec = self._get_or_create_process_executor()
+        pid = proc_exec.submit(token, spec, payload, ctx)
+        rt = self._task_states.get(token.task_id)
+        if rt is not None:
+            rt.worker_pid = pid
+            # Anchor deadline after OS process spawn completes so spawn overhead does not consume task timeout
+            if spec.timeout_seconds is not None:
+                rt.deadline_at = self._clock.now() + spec.timeout_seconds
 
     # ------------------------------------------------------------------
     # Crash Recovery & Log Replay
@@ -1107,7 +1600,8 @@ class WorkflowEngine:
         """
         Replay the durable event log to reconstruct workflow state after an
         interruption, repair any truncated final log record, validate task
-        definitions, reconcile in-flight states, and optionally resume execution.
+        definitions and canonical hashes, reconcile in-flight states, and
+        optionally resume execution.
         """
         with self._file_lock.acquire():
             with self._cond:
@@ -1117,6 +1611,9 @@ class WorkflowEngine:
                 for (_tid, _ep), ev in list(self._active_cancel_events.items()):
                     ev.set()
                 self._active_cancel_events.clear()
+                if self._process_executor is not None:
+                    self._process_executor.shutdown(force=True)
+                    self._process_executor = None
 
                 prior_max_epoch = self._global_claim_epoch
                 self._task_states = {
@@ -1128,15 +1625,48 @@ class WorkflowEngine:
                 self._status = WorkflowStatus.CREATED
                 self._cancel_requested = False
                 self._structured_logs.clear()
+                self._succeeded_count = 0
+                self._failed_count = 0
+                self._cancelled_count = 0
+                self._stale_completion_count = 0
+                self._recovery_event_count = 0
+                self._timeout_event_count = 0
+                self._worker_crash_count = 0
+                self._retry_scheduled_count = 0
 
                 replay_res = self._event_log.replay(repair_truncated_tail=True)
                 self._truncated_tail_repaired = replay_res.truncated_tail_repaired
 
+                ver_result = None
                 for rec in replay_res.records:
-                    self._apply_event(rec, is_recovery=True)
+                    res = self._apply_event(rec, is_recovery=True)
+                    if res is not None:
+                        ver_result = res
 
                 if self._global_claim_epoch < prior_max_epoch:
                     self._global_claim_epoch = prior_max_epoch
+
+                if (
+                    ver_result is not None
+                    and ver_result.migrated
+                    and self._status
+                    not in (
+                        WorkflowStatus.SUCCEEDED,
+                        WorkflowStatus.FAILED,
+                        WorkflowStatus.CANCELLED,
+                    )
+                ):
+                    mig_rec = self._event_log.append(
+                        "DEFINITION_MIGRATED",
+                        {
+                            "to_definition_version": ver_result.definition_version,
+                            "to_definition_hash": ver_result.definition_hash,
+                            "policy": self.compatibility_policy.value,
+                            "reason": ver_result.migration_reason
+                            or "COMPATIBILITY_POLICY_MIGRATION",
+                        },
+                    )
+                    self._apply_event(mig_rec, is_recovery=True)
 
                 if replay_res.truncated_tail_repaired:
                     self._structured_logs.append(
@@ -1151,9 +1681,10 @@ class WorkflowEngine:
                             from_state=None,
                             to_state=None,
                             reason="TRUNCATED_TAIL_REPAIRED",
+                            failure_category=FailureCategory.INFRASTRUCTURE_ERROR.value,
                             details={
                                 "truncated_offset": replay_res.truncated_offset,
-                                "warnings": replay_res.warnings,
+                                "warnings": list(replay_res.warnings),
                             },
                         )
                     )
@@ -1175,6 +1706,7 @@ class WorkflowEngine:
                                     TaskState.CANCELLED,
                                     reason="WORKFLOW_CANCELLED_ON_RECOVERY",
                                     claim_epoch=self._global_claim_epoch,
+                                    failure_category=FailureCategory.CANCELLED,
                                 )
                     else:
                         for tid in sorted(self._task_states.keys()):
@@ -1216,7 +1748,7 @@ class WorkflowEngine:
     # ------------------------------------------------------------------
 
     def get_status(self) -> WorkflowStatusSummary:
-        """Return a thread-safe snapshot of the workflow status and structured logs."""
+        """Return a thread-safe, deep-copied immutable snapshot of workflow status."""
         with self._lock:
             counts: dict[str, int] = {s.value: 0 for s in TaskState}
             task_views: dict[str, TaskResultView] = {}
@@ -1235,7 +1767,43 @@ class WorkflowEngine:
                     error_message=rt.error_message,
                     last_transition_reason=rt.last_transition_reason,
                     last_updated_at=rt.last_updated_at,
+                    retry_count=rt.retry_count,
+                    timeout_count=rt.timeout_count,
+                    failure_category=rt.failure_category,
+                    queue_delay_seconds=rt.queue_delay_seconds,
+                    execution_duration_seconds=rt.execution_duration_seconds,
+                    worker_pid=rt.worker_pid,
+                    exit_code=rt.exit_code,
                 )
+
+            copied_logs = [
+                StructuredLogEntry(
+                    seq=entry.seq,
+                    timestamp=entry.timestamp,
+                    workflow_id=entry.workflow_id,
+                    event_type=entry.event_type,
+                    task_id=entry.task_id,
+                    attempt=entry.attempt,
+                    claim_epoch=entry.claim_epoch,
+                    from_state=entry.from_state,
+                    to_state=entry.to_state,
+                    reason=entry.reason,
+                    failure_category=entry.failure_category,
+                    details=copy.deepcopy(entry.details),
+                )
+                for entry in self._structured_logs
+            ]
+
+            metrics = WorkflowMetrics(
+                succeeded_count=self._succeeded_count,
+                failed_count=self._failed_count,
+                cancelled_count=self._cancelled_count,
+                stale_completion_count=self._stale_completion_count,
+                recovery_event_count=self._recovery_event_count,
+                timeout_event_count=self._timeout_event_count,
+                worker_crash_count=self._worker_crash_count,
+                retry_scheduled_count=self._retry_scheduled_count,
+            )
 
             return WorkflowStatusSummary(
                 workflow_id=self.workflow_id,
@@ -1245,8 +1813,12 @@ class WorkflowEngine:
                 counts_by_state=counts,
                 tasks=task_views,
                 truncated_tail_repaired=self._truncated_tail_repaired,
-                log_record_count=len(self._structured_logs),
-                structured_logs=list(self._structured_logs),
+                log_record_count=len(copied_logs),
+                structured_logs=copied_logs,
+                definition_version=self.definition_version,
+                definition_hash=self._definition_hash,
+                execution_backend=self.execution_backend.value,
+                metrics=metrics,
             )
 
     def get_task_result(self, task_id: str) -> TaskResultView:
@@ -1270,6 +1842,13 @@ class WorkflowEngine:
                 error_message=rt.error_message,
                 last_transition_reason=rt.last_transition_reason,
                 last_updated_at=rt.last_updated_at,
+                retry_count=rt.retry_count,
+                timeout_count=rt.timeout_count,
+                failure_category=rt.failure_category,
+                queue_delay_seconds=rt.queue_delay_seconds,
+                execution_duration_seconds=rt.execution_duration_seconds,
+                worker_pid=rt.worker_pid,
+                exit_code=rt.exit_code,
             )
 
 
@@ -1279,7 +1858,7 @@ class WorkflowEngine:
 
 _REGISTRY_LOCK = threading.RLock()
 _WORKFLOW_REGISTRY: dict[str, WorkflowEngine] = {}
-_WORKFLOW_SPEC_CACHE: dict[str, tuple[list[TaskSpec], Path, int, Clock]] = {}
+_WORKFLOW_SPEC_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def create_workflow(
@@ -1291,6 +1870,17 @@ def create_workflow(
     clock: Clock | None = None,
     crash_hook: Callable[[str, dict[str, Any], int], None] | None = None,
     partial_write_bytes: int | None = None,
+    execution_backend: ExecutionBackend | str = ExecutionBackend.THREAD,
+    definition_version: int = 1,
+    compatibility_policy: CompatibilityPolicy | str = CompatibilityPolicy.STRICT,
+    max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+    max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+    max_output_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+    file_mode: int = DEFAULT_FILE_MODE,
+    hmac_key: bytes | None = None,
+    log_format_version: int | None = None,
+    metrics_sink: MetricsSink | None = None,
+    log_sensitive_payloads: bool = False,
 ) -> WorkflowEngine:
     """Create and register a new workflow instance."""
     engine = WorkflowEngine(
@@ -1301,15 +1891,36 @@ def create_workflow(
         clock=clock,
         crash_hook=crash_hook,
         partial_write_bytes=partial_write_bytes,
+        execution_backend=execution_backend,
+        definition_version=definition_version,
+        compatibility_policy=compatibility_policy,
+        max_payload_bytes=max_payload_bytes,
+        max_frame_bytes=max_frame_bytes,
+        max_output_bytes=max_output_bytes,
+        file_mode=file_mode,
+        hmac_key=hmac_key,
+        log_format_version=log_format_version,
+        metrics_sink=metrics_sink,
+        log_sensitive_payloads=log_sensitive_payloads,
     )
     with _REGISTRY_LOCK:
         _WORKFLOW_REGISTRY[engine.workflow_id] = engine
-        _WORKFLOW_SPEC_CACHE[engine.workflow_id] = (
-            list(tasks),
-            engine.storage_dir,
-            engine.max_concurrency,
-            engine._clock,
-        )
+        _WORKFLOW_SPEC_CACHE[engine.workflow_id] = {
+            "tasks": list(tasks),
+            "storage_dir": engine.storage_dir,
+            "max_concurrency": engine.max_concurrency,
+            "clock": engine._clock,
+            "execution_backend": engine.execution_backend,
+            "definition_version": engine.definition_version,
+            "compatibility_policy": engine.compatibility_policy,
+            "max_payload_bytes": engine.max_payload_bytes,
+            "max_frame_bytes": engine.max_frame_bytes,
+            "max_output_bytes": engine.max_output_bytes,
+            "file_mode": engine.file_mode,
+            "hmac_key": hmac_key,
+            "metrics_sink": metrics_sink,
+            "log_sensitive_payloads": log_sensitive_payloads,
+        }
     return engine
 
 
@@ -1345,8 +1956,25 @@ def recover_workflow(
     max_concurrency: int | None = None,
     clock: Clock | None = None,
     auto_run: bool = True,
+    execution_backend: ExecutionBackend | str | None = None,
+    definition_version: int | None = None,
+    compatibility_policy: CompatibilityPolicy | str | None = None,
+    hmac_key: bytes | None = None,
+    metrics_sink: MetricsSink | None = None,
 ) -> WorkflowStatusSummary:
-    """Recover a workflow from its durable on-disk event log after a process crash or restart."""
+    """
+    Recover a workflow from its durable on-disk event log after a process crash
+    or restart.
+
+    Note on Workflow Definition Verification:
+    `recover_workflow` verifies the persisted `WORKFLOW_CREATED` definition
+    version, canonical SHA-256 `definition_hash`, and task specifications
+    against the provided `tasks` (or the in-process registered `TaskSpec`
+    definitions if recovering within the same process). Across a fresh OS
+    process boundary, callers MUST pass `tasks` explicitly; omitting `tasks`
+    raises `WorkflowNotFoundError` / `MissingWorkflowDefinitionError`. For
+    read-only inspection without task callables, use `inspect_workflow_log()`.
+    """
     if isinstance(workflow_id, WorkflowEngine):
         wf_id = workflow_id.workflow_id
         resolved_tasks = (
@@ -1363,8 +1991,33 @@ def recover_workflow(
             else workflow_id.max_concurrency
         )
         resolved_clock = clock if clock is not None else workflow_id._clock
+        resolved_backend = (
+            execution_backend
+            if execution_backend is not None
+            else workflow_id.execution_backend
+        )
+        resolved_def_ver = (
+            definition_version
+            if definition_version is not None
+            else workflow_id.definition_version
+        )
+        resolved_policy = (
+            compatibility_policy
+            if compatibility_policy is not None
+            else workflow_id.compatibility_policy
+        )
+        resolved_hmac = (
+            hmac_key
+            if hmac_key is not None
+            else workflow_id._event_log._hmac_key
+        )
+        resolved_sink = (
+            metrics_sink
+            if metrics_sink is not None
+            else workflow_id._metrics_sink
+        )
     else:
-        wf_id = workflow_id
+        wf_id = validate_workflow_id(workflow_id)
         with _REGISTRY_LOCK:
             cached = _WORKFLOW_SPEC_CACHE.get(wf_id)
             existing = _WORKFLOW_REGISTRY.get(wf_id)
@@ -1374,11 +2027,12 @@ def recover_workflow(
         elif existing is not None:
             resolved_tasks = list(existing._raw_tasks)
         elif cached is not None:
-            resolved_tasks = list(cached[0])
+            resolved_tasks = list(cached["tasks"])
         else:
             raise WorkflowNotFoundError(
-                f"Workflow '{wf_id}' is not in memory; pass `tasks` and `storage_dir` "
-                "to reconstruct across a fresh process boundary."
+                f"Workflow '{wf_id}' is not registered in memory; pass `tasks` and `storage_dir` "
+                "explicitly to verify the workflow definition across a fresh process boundary, "
+                "or use `inspect_workflow_log()` for read-only log inspection."
             )
 
         if storage_dir is not None:
@@ -1386,7 +2040,7 @@ def recover_workflow(
         elif existing is not None:
             resolved_dir = existing.storage_dir
         elif cached is not None:
-            resolved_dir = cached[1]
+            resolved_dir = cached["storage_dir"]
         else:
             resolved_dir = Path(tempfile.gettempdir()) / "chimera_workflows"
 
@@ -1395,7 +2049,7 @@ def recover_workflow(
         elif existing is not None:
             resolved_conc = existing.max_concurrency
         elif cached is not None:
-            resolved_conc = cached[2]
+            resolved_conc = cached["max_concurrency"]
         else:
             resolved_conc = 4
 
@@ -1404,9 +2058,54 @@ def recover_workflow(
         elif existing is not None:
             resolved_clock = existing._clock
         elif cached is not None:
-            resolved_clock = cached[3]
+            resolved_clock = cached["clock"]
         else:
             resolved_clock = SystemClock()
+
+        if execution_backend is not None:
+            resolved_backend = execution_backend
+        elif existing is not None:
+            resolved_backend = existing.execution_backend
+        elif cached is not None:
+            resolved_backend = cached["execution_backend"]
+        else:
+            resolved_backend = ExecutionBackend.THREAD
+
+        if definition_version is not None:
+            resolved_def_ver = definition_version
+        elif existing is not None:
+            resolved_def_ver = existing.definition_version
+        elif cached is not None:
+            resolved_def_ver = cached["definition_version"]
+        else:
+            resolved_def_ver = 1
+
+        if compatibility_policy is not None:
+            resolved_policy = compatibility_policy
+        elif existing is not None:
+            resolved_policy = existing.compatibility_policy
+        elif cached is not None:
+            resolved_policy = cached["compatibility_policy"]
+        else:
+            resolved_policy = CompatibilityPolicy.STRICT
+
+        if hmac_key is not None:
+            resolved_hmac = hmac_key
+        elif existing is not None:
+            resolved_hmac = existing._event_log._hmac_key
+        elif cached is not None:
+            resolved_hmac = cached["hmac_key"]
+        else:
+            resolved_hmac = None
+
+        if metrics_sink is not None:
+            resolved_sink = metrics_sink
+        elif existing is not None:
+            resolved_sink = existing._metrics_sink
+        elif cached is not None:
+            resolved_sink = cached["metrics_sink"]
+        else:
+            resolved_sink = None
 
     fresh_engine = WorkflowEngine(
         tasks=resolved_tasks,
@@ -1415,6 +2114,11 @@ def recover_workflow(
         storage_dir=resolved_dir,
         clock=resolved_clock,
         crash_hook=None,
+        execution_backend=resolved_backend,
+        definition_version=resolved_def_ver,
+        compatibility_policy=resolved_policy,
+        hmac_key=resolved_hmac,
+        metrics_sink=resolved_sink,
     )
     with _REGISTRY_LOCK:
         if wf_id in _WORKFLOW_REGISTRY:

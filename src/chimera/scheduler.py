@@ -49,6 +49,13 @@ def invoke_task_callable(
 class DeterministicReadyScheduler:
     """
     Min-heap ready queue ordered deterministically by `(priority, task_id)`.
+
+    Fairness & Starvation Note:
+    Tasks with lower numerical `priority` values execute first, with ties
+    broken lexicographically by `task_id`. Because a workflow DAG is finite and
+    acyclic, all eligible higher-priority tasks complete in finite steps
+    (bounded by `max_retries`), guaranteeing freedom from indefinite starvation
+    within a single workflow execution.
     """
 
     def __init__(self) -> None:
@@ -69,6 +76,9 @@ class DeterministicReadyScheduler:
 
     def has_ready(self) -> bool:
         return bool(self._in_queue)
+
+    def ready_count(self) -> int:
+        return len(self._in_queue)
 
     def pop_next_ready(
         self, task_states: Mapping[str, TaskRuntimeState]

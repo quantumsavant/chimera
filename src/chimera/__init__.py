@@ -1,10 +1,17 @@
 """
-CHIMERA — Fault-Tolerant DAG Workflow Engine.
+CHIMERA — Production-Grade Fault-Tolerant DAG Workflow Engine.
 """
 
 from __future__ import annotations
 
 from chimera.clock import Clock, SystemClock, VirtualClock
+from chimera.diagnostics import (
+    InMemoryMetricsSink,
+    LogInspectionReport,
+    MetricsSink,
+    NullMetricsSink,
+    inspect_workflow_log,
+)
 from chimera.engine import (
     WorkflowEngine,
     cancel_workflow,
@@ -21,40 +28,71 @@ from chimera.exceptions import (
     CorruptedStateTransitionError,
     CycleDetectedError,
     DuplicateTaskIdError,
+    ExecutorError,
     InvalidStateTransitionError,
+    InvalidWorkflowIdError,
+    LegacyLogMigrationError,
+    LogAuthenticationError,
     LogCorruptionError,
     MissingDependencyError,
+    MissingWorkflowDefinitionError,
+    OversizedFrameError,
+    OversizedPayloadError,
+    PayloadSerializationError,
+    ProcessWorkerCrashError,
     SimulatedProcessCrash,
+    TaskOutputLimitExceededError,
     TaskTimeoutError,
+    UnserializableCallableError,
+    WorkflowDefinitionMismatchError,
     WorkflowNotFoundError,
+    WorkflowShutdownError,
     WorkflowValidationError,
 )
-from chimera.locking import WorkflowFileLock
+from chimera.executor import ProcessTaskExecutor, TaskAttemptResult
+from chimera.locking import DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, WorkflowFileLock
 from chimera.models import (
     LIVE_ALLOWED_TRANSITIONS,
     RECOVERY_ALLOWED_TRANSITIONS,
     TERMINAL_TASK_STATES,
     ClaimToken,
+    CompatibilityPolicy,
+    ExecutionBackend,
+    FailureCategory,
     StructuredLogEntry,
     TaskContext,
     TaskResultView,
     TaskRuntimeState,
     TaskSpec,
     TaskState,
+    WorkflowMetrics,
     WorkflowStatus,
     WorkflowStatusSummary,
+    compute_workflow_definition_hash,
 )
 from chimera.persistence import (
     FRAME_HEADER_LEN,
     FRAME_MAGIC,
+    FRAME_V2_HEADER_LEN,
+    FRAME_V2_MAGIC,
     EventLog,
     ReplayResult,
 )
-from chimera.recovery import RecoveryManager
+from chimera.recovery import DefinitionVerificationResult, RecoveryManager
 from chimera.scheduler import DeterministicReadyScheduler
-from chimera.validation import validate_dag
+from chimera.serialization import (
+    DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    canonical_json_bytes,
+    canonical_json_dumps,
+    canonical_json_loads,
+    compute_canonical_sha256,
+    validate_callable_for_process_backend,
+    validate_canonical_json_value,
+)
+from chimera.validation import validate_dag, validate_workflow_id
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -63,36 +101,75 @@ __all__ = [
     "VirtualClock",
     "ChimeraError",
     "WorkflowValidationError",
+    "InvalidWorkflowIdError",
     "DuplicateTaskIdError",
     "MissingDependencyError",
     "CycleDetectedError",
+    "PayloadSerializationError",
+    "OversizedPayloadError",
+    "WorkflowDefinitionMismatchError",
+    "MissingWorkflowDefinitionError",
+    "LegacyLogMigrationError",
     "InvalidStateTransitionError",
     "LogCorruptionError",
+    "OversizedFrameError",
+    "LogAuthenticationError",
     "CorruptedStateTransitionError",
     "ConcurrentWorkflowAccessError",
+    "ExecutorError",
+    "UnserializableCallableError",
+    "ProcessWorkerCrashError",
+    "TaskOutputLimitExceededError",
     "TaskTimeoutError",
     "WorkflowNotFoundError",
+    "WorkflowShutdownError",
     "SimulatedProcessCrash",
+    "DEFAULT_FILE_MODE",
+    "DEFAULT_DIR_MODE",
     "WorkflowFileLock",
     "TaskState",
     "TERMINAL_TASK_STATES",
     "LIVE_ALLOWED_TRANSITIONS",
     "RECOVERY_ALLOWED_TRANSITIONS",
     "WorkflowStatus",
+    "ExecutionBackend",
+    "CompatibilityPolicy",
+    "FailureCategory",
     "ClaimToken",
     "TaskContext",
     "TaskSpec",
+    "compute_workflow_definition_hash",
     "TaskRuntimeState",
     "TaskResultView",
     "StructuredLogEntry",
+    "WorkflowMetrics",
     "WorkflowStatusSummary",
     "FRAME_MAGIC",
+    "FRAME_V2_MAGIC",
     "FRAME_HEADER_LEN",
+    "FRAME_V2_HEADER_LEN",
     "ReplayResult",
     "EventLog",
+    "DefinitionVerificationResult",
     "RecoveryManager",
     "DeterministicReadyScheduler",
+    "ProcessTaskExecutor",
+    "TaskAttemptResult",
+    "DEFAULT_MAX_PAYLOAD_BYTES",
+    "DEFAULT_MAX_FRAME_BYTES",
+    "validate_canonical_json_value",
+    "canonical_json_dumps",
+    "canonical_json_bytes",
+    "canonical_json_loads",
+    "compute_canonical_sha256",
+    "validate_callable_for_process_backend",
+    "validate_workflow_id",
     "validate_dag",
+    "MetricsSink",
+    "NullMetricsSink",
+    "InMemoryMetricsSink",
+    "LogInspectionReport",
+    "inspect_workflow_log",
     "WorkflowEngine",
     "create_workflow",
     "validate_workflow",

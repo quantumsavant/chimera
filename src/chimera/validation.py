@@ -1,19 +1,64 @@
 """
-DAG structural validation: duplicate task ID detection, missing dependency
-detection, and iterative 3-color DFS cycle detection with exact path extraction.
+DAG structural validation and workflow identifier filesystem safety checks.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Sequence
 
 from chimera.exceptions import (
     CycleDetectedError,
     DuplicateTaskIdError,
+    InvalidWorkflowIdError,
     MissingDependencyError,
     WorkflowValidationError,
 )
 from chimera.models import TaskSpec
+
+_WORKFLOW_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+
+
+def validate_workflow_id(workflow_id: str) -> str:
+    """
+    Validate that `workflow_id` is safe for use in local filesystem filenames
+    across POSIX and Windows.
+
+    Rejects empty strings, strings > 128 chars, path separators (`/`, `\`),
+    parent directory traversal (`..`), NUL bytes, leading dots, and Windows
+    reserved device names (`CON`, `NUL`, `AUX`, `PRN`, `COM1`..`COM9`, `LPT1`..`LPT9`).
+    """
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise InvalidWorkflowIdError("workflow_id must be a non-empty string.")
+    if len(workflow_id) > 128:
+        raise InvalidWorkflowIdError(
+            f"workflow_id '{workflow_id[:32]}...' exceeds maximum length of 128 characters."
+        )
+    if ".." in workflow_id or "/" in workflow_id or "\\" in workflow_id or "\x00" in workflow_id:
+        raise InvalidWorkflowIdError(
+            f"workflow_id {workflow_id!r} contains forbidden path traversal or separator characters."
+        )
+    if not _WORKFLOW_ID_PATTERN.match(workflow_id):
+        raise InvalidWorkflowIdError(
+            f"workflow_id {workflow_id!r} must match '^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$'."
+        )
+    stem = workflow_id.split(".")[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        raise InvalidWorkflowIdError(
+            f"workflow_id {workflow_id!r} uses a reserved Windows device name ({stem})."
+        )
+    return workflow_id
 
 
 def validate_dag(tasks: Sequence[TaskSpec]) -> dict[str, TaskSpec]:

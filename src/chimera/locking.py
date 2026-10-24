@@ -1,15 +1,22 @@
 """
 Cross-process and in-process advisory file locking (`WorkflowFileLock`).
 
-Platform support:
+Platform support & semantics:
 - POSIX (Linux, macOS): Uses `fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)`
   on `<workflow_id>.chimera.lock`.
 - Windows (`nt`): Uses `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` on the first
-  byte of `<workflow_id>.chimera.lock`, opened with `os.O_BINARY`.
+  byte of `<workflow_id>.chimera.lock`, opened with `os.O_BINARY` and ensured
+  non-empty.
 - In-process protection: Uses a process-wide canonical path table
   (`_ACTIVE_IN_PROCESS_LOCKS`) normalized via `os.path.normcase(os.path.realpath(...))`
   so two separate `WorkflowEngine` or `EventLog` instances within the same
   Python process cannot concurrently mutate the same workflow log.
+- Fork safety: Tracks `_owner_pid = os.getpid()` so a forked child process
+  never inherits lock ownership depth from its parent.
+- Supported filesystems: Local POSIX and Windows (NTFS) filesystems. Network
+  filesystems (NFSv3 without lockd, SMB/CIFS without byte-range coherency) do
+  not provide reliable advisory locking and are not supported. Local file locks
+  do NOT provide multi-host distributed consensus.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import threading
 from typing import Iterator
 
 from chimera.exceptions import ConcurrentWorkflowAccessError
+from chimera.validation import validate_workflow_id
 
 if os.name == "posix":
     import fcntl
@@ -28,9 +36,22 @@ elif os.name == "nt":  # pragma: no cover
     import msvcrt
 
 O_BINARY_FLAG: int = getattr(os, "O_BINARY", 0)
+DEFAULT_FILE_MODE: int = 0o600
+DEFAULT_DIR_MODE: int = 0o700
 
 _PROCESS_LOCK_GUARD = threading.RLock()
 _ACTIVE_IN_PROCESS_LOCKS: dict[str, int] = {}  # canonical lock_path -> owner_id
+
+
+def ensure_private_directory(path: Path, dir_mode: int = DEFAULT_DIR_MODE) -> None:
+    """Create directory `path` if missing with restrictive permissions."""
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=dir_mode)
+    if not existed and os.name == "posix":
+        try:
+            os.chmod(str(path), dir_mode)
+        except OSError:
+            pass
 
 
 def _os_try_lock_exclusive(fd: int) -> None:
@@ -55,26 +76,43 @@ class WorkflowFileLock:
     """
     Per-engine exclusive workflow lock.
 
-    Threads belonging to the SAME `WorkflowEngine` instance share ownership of
-    this lock via atomic reference counting (`self._depth`) without blocking
-    one another across `yield`, while any second `WorkflowEngine` instance (in
-    the same process or a separate OS process) attempting to acquire the lock
-    on the same path fails immediately with `ConcurrentWorkflowAccessError`.
+    Threads belonging to the SAME `WorkflowEngine` instance in the same OS
+    process share ownership of this lock via atomic reference counting
+    (`self._depth`) without blocking one another across `yield`, while any
+    second `WorkflowEngine` instance (in the same process or a separate OS
+    process) attempting to acquire the lock on the same path fails immediately
+    with `ConcurrentWorkflowAccessError`.
     """
 
-    def __init__(self, lock_path: str | Path, workflow_id: str) -> None:
+    def __init__(
+        self,
+        lock_path: str | Path,
+        workflow_id: str,
+        *,
+        file_mode: int = DEFAULT_FILE_MODE,
+    ) -> None:
+        validate_workflow_id(workflow_id)
         self.lock_path = Path(lock_path)
         self.workflow_id = workflow_id
+        self.file_mode = file_mode
         self._owner_id = id(self)
+        self._owner_pid = os.getpid()
         self._state_mutex = threading.Lock()
         self._depth = 0
         self._fd: int | None = None
 
     def _acquire_internal(self) -> str:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(self.lock_path.parent)
         canonical_key = os.path.normcase(os.path.realpath(str(self.lock_path)))
+        current_pid = os.getpid()
 
         with self._state_mutex:
+            if self._owner_pid != current_pid:
+                # Reset state if inherited across an os.fork() boundary
+                self._owner_pid = current_pid
+                self._depth = 0
+                self._fd = None
+
             if self._depth > 0:
                 self._depth += 1
                 return canonical_key
@@ -93,12 +131,23 @@ class WorkflowFileLock:
                 fd = os.open(
                     str(self.lock_path),
                     os.O_CREAT | os.O_RDWR | O_BINARY_FLAG,
-                    0o644,
+                    self.file_mode,
                 )
                 try:
+                    if os.name == "posix":
+                        try:
+                            os.fchmod(fd, self.file_mode)
+                        except OSError:
+                            pass
                     _os_try_lock_exclusive(fd)
+                    # Ensure at least 1 byte exists for Windows byte-range lock compatibility
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"L")
                 except (BlockingIOError, PermissionError, OSError) as exc:
-                    os.close(fd)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                     raise ConcurrentWorkflowAccessError(
                         f"Workflow '{self.workflow_id}' ({canonical_key}) is locked by another "
                         f"concurrent process: {exc}"
@@ -111,6 +160,8 @@ class WorkflowFileLock:
 
     def _release_internal(self, canonical_key: str) -> None:
         with self._state_mutex:
+            if self._depth <= 0:
+                return
             self._depth -= 1
             if self._depth == 0 and self._fd is not None:
                 fd_to_close = self._fd
